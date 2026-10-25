@@ -7,7 +7,7 @@
 //  3. кладёт Russian.pak в Data\Localization\Russian;
 //  4. меняет в Language.lsx значение English на Russian.
 //
-// Запуск с параметром --restore возвращает английский язык.
+// Меню: русификатор, озвучка или оба сразу; --restore возвращает английский язык.
 package main
 
 import (
@@ -43,35 +43,76 @@ var keepFiles = map[string]bool{
 
 var stdin = bufio.NewReader(os.Stdin)
 
+// Действия, которые можно выбрать в меню или флагами.
+type options struct {
+	text, voice        bool // поставить русификатор / озвучку
+	restore, rmVoice   bool // вернуть английский / убрать озвучку
+	voiceSrc, gamePath string
+}
+
+func (o options) chosen() bool { return o.text || o.voice || o.restore || o.rmVoice }
+
 func main() {
-	restore, chosen := false, false
-	var userPath string
+	var o options
 	for _, a := range os.Args[1:] {
-		switch strings.ToLower(a) {
-		case "--restore", "-restore", "/restore":
-			restore, chosen = true, true
-		case "--install", "-install", "/install":
-			chosen = true
+		l := strings.ToLower(a)
+		switch {
+		case l == "--restore" || l == "-restore" || l == "/restore":
+			o.restore = true
+		case l == "--install" || l == "-install" || l == "/install" || l == "--text":
+			o.text = true
+		case l == "--voice":
+			o.voice = true
+		case l == "--all":
+			o.text, o.voice = true, true
+		case l == "--remove-voice":
+			o.rmVoice = true
+		case strings.HasPrefix(l, "--voice-src="):
+			o.voice, o.voiceSrc = true, a[len("--voice-src="):]
 		default:
-			userPath = a
+			o.gamePath = a
 		}
 	}
 
 	fmt.Println("=============================================")
-	fmt.Println("  Baldur's Gate 3 — установка русского языка")
+	fmt.Println("  Baldur's Gate 3 — русификатор и озвучка")
 	fmt.Println("=============================================")
 	fmt.Println()
 
-	if !chosen {
-		fmt.Println("1 — Установить русский язык")
-		fmt.Println("2 — Вернуть английский язык")
-		if ask("Ваш выбор [1]: ") == "2" {
-			restore = true
+	if !o.chosen() {
+		fmt.Println("1 — Русификатор + русская озвучка")
+		fmt.Println("2 — Только русификатор (текст)")
+		fmt.Println("3 — Только русская озвучка")
+		fmt.Println("4 — Вернуть английский язык (убрать русификатор)")
+		fmt.Println("5 — Удалить русскую озвучку")
+		switch ask("Ваш выбор [1]: ") {
+		case "2":
+			o.text = true
+		case "3":
+			o.voice = true
+		case "4":
+			o.restore = true
+		case "5":
+			o.rmVoice = true
+		default:
+			o.text, o.voice = true, true
 		}
 		fmt.Println()
 	}
+	if o.voice && o.voiceSrc == "" {
+		// Спрашиваем источник до возможного перезапуска от администратора.
+		if src, err := findVoiceSource(""); err == nil {
+			o.voiceSrc = src
+		} else if !o.text {
+			fmt.Println("ОШИБКА:", err)
+			ask("Нажмите Enter для выхода...")
+			os.Exit(1)
+		} else {
+			o.voice = false
+		}
+	}
 
-	err := run(userPath, restore)
+	err := run(o)
 	if err != nil {
 		fmt.Println()
 		fmt.Println("ОШИБКА:", err)
@@ -83,25 +124,42 @@ func main() {
 	}
 }
 
-func run(userPath string, restore bool) error {
-	locDir, err := findLocalization(userPath)
+func run(o options) error {
+	locDir, err := findLocalization(o.gamePath)
 	if err != nil {
 		return err
 	}
 	fmt.Println("Папка локализации:", locDir)
 
 	if err := checkWritable(locDir); err != nil {
-		if errors.Is(err, fs.ErrPermission) && relaunchAsAdmin(locDir, restore) {
+		if errors.Is(err, fs.ErrPermission) && relaunchAsAdmin(locDir, o) {
 			fmt.Println("Нет прав на запись — программа перезапущена от имени администратора.")
 			return nil
 		}
 		return fmt.Errorf("нет доступа на запись в %s (%v).\nЗапустите программу от имени администратора", locDir, err)
 	}
 
-	if restore {
-		return restoreEnglish(locDir)
+	if o.restore {
+		if err := restoreEnglish(locDir); err != nil {
+			return err
+		}
 	}
-	return installRussian(locDir)
+	if o.rmVoice {
+		if err := removeVoice(locDir); err != nil {
+			return err
+		}
+	}
+	if o.text {
+		if err := installRussian(locDir); err != nil {
+			return err
+		}
+	}
+	if o.voice {
+		if err := installVoice(locDir, o.voiceSrc); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func installRussian(locDir string) error {
@@ -360,7 +418,7 @@ func checkWritable(dir string) error {
 }
 
 // relaunchAsAdmin перезапускает программу с правами администратора (UAC).
-func relaunchAsAdmin(locDir string, restore bool) bool {
+func relaunchAsAdmin(locDir string, o options) bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
@@ -369,13 +427,16 @@ func relaunchAsAdmin(locDir string, restore bool) bool {
 		return false
 	}
 	psQuote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
-	args := psQuote(`"` + locDir + `"`)
-	if restore {
-		args += "," + psQuote("--restore")
-	} else {
-		args += "," + psQuote("--install")
+	list := []string{psQuote(`"` + locDir + `"`)}
+	for flag, on := range map[string]bool{"--text": o.text, "--voice": o.voice, "--restore": o.restore, "--remove-voice": o.rmVoice} {
+		if on {
+			list = append(list, psQuote(flag))
+		}
 	}
-	ps := fmt.Sprintf("Start-Process -FilePath %s -ArgumentList %s -Verb RunAs", psQuote(exe), args)
+	if o.voiceSrc != "" {
+		list = append(list, psQuote(`--voice-src=`+o.voiceSrc))
+	}
+	ps := fmt.Sprintf("Start-Process -FilePath %s -ArgumentList %s -Verb RunAs", psQuote(exe), strings.Join(list, ","))
 	return exec.Command("powershell", "-NoProfile", "-Command", ps).Run() == nil
 }
 
