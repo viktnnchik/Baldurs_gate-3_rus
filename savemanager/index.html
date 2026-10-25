@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Менеджер сохранений BG3</title>
+<style>
+  :root {
+    --bg: #14120f; --panel: #1e1b16; --line: #34302a; --text: #ece5d8; --muted: #9a917f;
+    --gold: #c9a24b; --gold-ink: #1a1405; --danger: #c0533f; --ok: #6aa56a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { padding: 18px 24px 8px; display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 22px; color: var(--gold); letter-spacing: .3px; }
+  header small { color: var(--muted); word-break: break-all; }
+  main { padding: 8px 24px 32px; display: grid; gap: 18px; max-width: 1000px; margin: 0 auto; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  section h2 { margin: 0 0 10px; font-size: 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .spacer { flex: 1; }
+  button { background: #2b261d; color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 7px 13px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--gold); }
+  button.primary { background: var(--gold); color: var(--gold-ink); border-color: var(--gold); font-weight: 600; }
+  button.danger:hover { border-color: var(--danger); color: var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  tr:last-child td { border-bottom: 0; }
+  td.act { text-align: right; white-space: nowrap; }
+  td.act button { margin-left: 6px; padding: 4px 10px; font-size: 13px; }
+  .tag { font-size: 12px; border: 1px solid var(--line); border-radius: 20px; padding: 1px 8px; color: var(--muted); }
+  .empty { color: var(--muted); padding: 10px 0; }
+  .err { color: var(--danger); }
+  label { color: var(--muted); font-size: 13px; display: block; margin-bottom: 4px; }
+  input[type=text], input[type=number] { background: #12100c; color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; font: inherit; width: 100%; }
+  .row { display: grid; grid-template-columns: 1fr 150px 130px auto; gap: 12px; align-items: end; }
+  @media (max-width: 720px) { .row { grid-template-columns: 1fr; } header, main { padding-left: 16px; padding-right: 16px; } }
+  #toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--gold); padding: 10px 18px; border-radius: 9px; opacity: 0; pointer-events: none; transition: opacity .2s; max-width: 90vw; }
+  #toast.show { opacity: 1; }
+  #toast.bad { border-color: var(--danger); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Менеджер сохранений BG3</h1>
+  <small id="dirs"></small>
+</header>
+<main>
+  <section>
+    <h2>Сохранения в игре
+      <span class="spacer"></span>
+      <button id="backupSel" disabled>Копировать выбранные</button>
+      <button id="backupAll" class="primary">Копировать все</button>
+    </h2>
+    <div id="saves"></div>
+  </section>
+
+  <section>
+    <h2>Резервные копии <span class="spacer"></span><button id="openDir">Открыть папку</button></h2>
+    <div id="backups"></div>
+  </section>
+
+  <section>
+    <h2>Настройки</h2>
+    <div class="row">
+      <div><label for="savesDir">Папка сохранений (Savegames\Story)</label><input type="text" id="savesDir"></div>
+      <div><label for="auto">Автокопия, мин (0 — выкл.)</label><input type="number" id="auto" min="0" max="1440"></div>
+      <div><label for="keep">Хранить автокопий</label><input type="number" id="keep" min="1" max="500"></div>
+      <button id="saveSettings">Сохранить</button>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const token = new URLSearchParams(location.search).get('t') || '';
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let state = null;
+const selected = new Set();
+
+async function call(path, body) {
+  const r = await fetch('/api/' + path, {
+    method: body ? 'POST' : 'GET',
+    headers: { 'X-Token': token, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function toast(msg, bad) {
+  const t = $('toast');
+  t.textContent = msg; t.className = 'show' + (bad ? ' bad' : '');
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = '', 4000);
+}
+
+const fmtSize = n => n > 1048576 ? (n / 1048576).toFixed(1) + ' МБ' : Math.max(1, Math.round(n / 1024)) + ' КБ';
+const fmtDate = s => s ? new Date(s).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' }) : '—';
+
+function render() {
+  $('dirs').textContent = 'Копии: ' + state.backupDir;
+  const saves = $('saves');
+  if (state.savesError) {
+    saves.innerHTML = '<div class="empty err">' + esc(state.savesError) + '<br>Укажите правильную папку в настройках ниже.</div>';
+  } else if (!state.saves.length) {
+    saves.innerHTML = '<div class="empty">Сохранений пока нет.</div>';
+  } else {
+    saves.innerHTML = '<table><tr><th></th><th>Сохранение</th><th>Изменено</th><th>Размер</th></tr>' +
+      state.saves.map(s => `<tr><td><input type="checkbox" data-name="${esc(s.name)}" ${selected.has(s.name) ? 'checked' : ''}></td>
+        <td>${esc(s.name)}</td><td>${fmtDate(s.modified)}</td><td>${fmtSize(s.size)}</td></tr>`).join('') + '</table>';
+  }
+  const b = $('backups');
+  b.innerHTML = state.backups.length
+    ? '<table><tr><th>Дата</th><th>Что внутри</th><th>Размер</th><th></th></tr>' +
+      state.backups.map(x => `<tr><td>${fmtDate(x.created)}${x.auto ? ' <span class="tag">авто</span>' : ''}</td>
+        <td>${x.saves.length} сохр.: ${esc(x.saves.slice(0, 2).join(', '))}${x.saves.length > 2 ? '…' : ''}</td>
+        <td>${fmtSize(x.size)}</td>
+        <td class="act"><button data-restore="${esc(x.file)}">Восстановить</button><button class="danger" data-del="${esc(x.file)}">Удалить</button></td></tr>`).join('') + '</table>'
+    : '<div class="empty">Копий ещё нет — нажмите «Копировать все».</div>';
+  $('backupSel').disabled = !selected.size;
+}
+
+function fillSettings() {
+  $('savesDir').value = state.savesDir;
+  $('auto').value = state.autoMinutes;
+  $('keep').value = state.keepAuto;
+}
+
+async function refresh(withSettings) {
+  state = await call('state');
+  render();
+  if (withSettings) fillSettings();
+}
+
+async function run(fn, okMsg) {
+  try { const r = await fn(); await refresh(); if (okMsg) toast(typeof okMsg === 'function' ? okMsg(r) : okMsg); }
+  catch (e) { toast(e.message, true); }
+}
+
+$('saves').addEventListener('change', e => {
+  const n = e.target.dataset.name;
+  if (n) { e.target.checked ? selected.add(n) : selected.delete(n); $('backupSel').disabled = !selected.size; }
+});
+$('backupAll').onclick = () => run(() => call('backup', { names: [] }), 'Копия создана');
+$('backupSel').onclick = () => run(() => call('backup', { names: [...selected] }), 'Копия создана');
+$('openDir').onclick = () => call('openfolder', {}).catch(() => {});
+$('backups').addEventListener('click', e => {
+  const rf = e.target.dataset.restore, df = e.target.dataset.del;
+  if (rf && confirm('Восстановить сохранения из этой копии?\nТекущие версии будут перезаписаны (перед этим программа сделает страховочную копию).'))
+    run(() => call('restore', { file: rf }), r => 'Восстановлено. Страховочная копия: ' + (r.safety || 'не понадобилась'));
+  if (df && confirm('Удалить эту копию безвозвратно?')) run(() => call('delete', { file: df }), 'Копия удалена');
+});
+$('saveSettings').onclick = async () => {
+  try {
+    await call('settings', { savesDir: $('savesDir').value, autoMinutes: +$('auto').value || 0, keepAuto: +$('keep').value || 20 });
+    await refresh(true); toast('Настройки сохранены');
+  } catch (e) { toast(e.message, true); }
+};
+
+setInterval(() => call('ping').catch(() => {}), 4000);
+call('ping').catch(() => {});
+setInterval(() => refresh().catch(() => {}), 10000);
+refresh(true).catch(e => toast(e.message, true));
+</script>
+</body>
+</html>
